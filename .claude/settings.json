@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "kicad": {
+      "command": "/usr/bin/python",
+      "args": ["/home/dev/projects/kicad-ai-project-creator/kicad_mcp_server.py"]
+    }
+  }
+}

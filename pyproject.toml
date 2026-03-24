@@ -4,15 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kicad-ai"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=0.40.0",
-    "python-dotenv>=1.0.0",
+    "mcp>=1.0.0",
 ]
-
-[project.scripts]
-kicad-ai = "kicad_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
