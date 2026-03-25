@@ -1,28 +1,24 @@
 """
-KiCad Tool Dispatcher — Stub Implementation
+KiCad Tool Dispatcher
 
-This module is the bridge between the AI agent and KiCad.
-Replace each stub with a real implementation that calls the KiCad IPC API,
-pcbnew Python scripting API, or your own KiCad automation layer.
+Two backends:
+  - kicad-cli  : subprocess calls for all fab outputs and ERC/DRC
+                 (IPC API has no export support — kicad-cli is the right path)
+  - kipy IPC   : live KiCad connection for PCB read/write operations
+                 `pip install kicad-python` — module name is `kipy`
+                 Connects via KICAD_API_SOCKET env var or /tmp/kicad/api.sock
+                 KiCad must be running. No schematic API yet (PCB only).
+  - stubs      : in-memory fallback when no project file is set
 
-KiCad scripting documentation:
-  https://docs.kicad.org/doxygen-python/namespacepcbnew.html
-
-KiCad IPC API (KiCad 8+):
-  https://dev-docs.kicad.org/en/ipc/
-
-Each function receives a dict of validated inputs (matching the tool's
-input_schema) and must return a JSON-serialisable dict with at least:
-  {"status": "ok", ...}          on success
-  {"status": "error", "message": "..."}  on failure
-
-The agent reads these return values and decides how to proceed.
+Call set_project(pcb_file=..., sch_file=...) before any real operation.
 """
 
 from __future__ import annotations
 import json
 import math
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +28,8 @@ from typing import Any
 # ─────────────────────────────────────────────────────────────────────────────
 
 _project_state: dict[str, Any] = {
+    "pcb_file":    None,   # path to .kicad_pcb
+    "sch_file":    None,   # path to .kicad_sch
     "sheets": {},          # sheet_name → {components, nets, labels}
     "footprints": {},      # reference → footprint_path
     "placements": {},      # reference → {x, y, rotation, layer}
@@ -41,6 +39,67 @@ _project_state: dict[str, Any] = {
     "board_outline": None, # {width, height, corner_radius}
     "bom": {},             # reference → component info
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Project setup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def set_project(
+    pcb_file: str | None = None,
+    sch_file: str | None = None,
+) -> dict:
+    """Store the active project file paths for this session."""
+    if pcb_file:
+        p = Path(pcb_file).expanduser().resolve()
+        if not p.exists():
+            return {"status": "error", "message": f"PCB file not found: {p}"}
+        _project_state["pcb_file"] = str(p)
+    if sch_file:
+        s = Path(sch_file).expanduser().resolve()
+        if not s.exists():
+            return {"status": "error", "message": f"Schematic file not found: {s}"}
+        _project_state["sch_file"] = str(s)
+    return {
+        "status": "ok",
+        "pcb_file": _project_state["pcb_file"],
+        "sch_file": _project_state["sch_file"],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# kipy IPC connection (PCB only — no schematic API yet)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _kicad():
+    """Return a connected kipy.kicad.KiCad instance, or raise ImportError / ConnectionError."""
+    from kipy.kicad import KiCad  # pip install kicad-python
+    return KiCad()
+
+
+def _pcb_file(override: str | None = None) -> str | None:
+    return override or _project_state.get("pcb_file")
+
+
+def _sch_file(override: str | None = None) -> str | None:
+    return override or _project_state.get("sch_file")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# kicad-cli helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_cli(*args: str) -> tuple[int, str, str]:
+    """Run kicad-cli and return (returncode, stdout, stderr)."""
+    result = subprocess.run(
+        ["kicad-cli", *args],
+        capture_output=True, text=True,
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def _cli_error(stderr: str, returncode: int) -> dict:
+    return {"status": "error", "message": stderr.strip() or f"kicad-cli exited {returncode}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -463,65 +522,103 @@ def assign_footprint(reference: str, footprint_path: str) -> dict:
 
 def run_erc(scope: str = "all") -> dict:
     """
-    Stub ERC. Replace with a call to KiCad's ERC engine via the IPC API
-    or the pcbnew Python scripting interface.
-
-    Real implementation should return one entry per violation with:
-      type           — pin_unconnected | label_dangling | duplicate_ref |
-                       missing_power_flag | bus_entry_conflict | ...
-      severity       — error | warning
-      symbol_ref     — e.g. "U2"
-      pin_name       — e.g. "LRCLK" (if applicable)
-      position_x/y   — schematic coordinates of the violation
-      suggested_fix  — human/AI-readable fix description, e.g.:
-                       "Move label I2S_LRCLK 2.54mm left to snap to U2:LRCLK pin endpoint"
+    Run ERC via kicad-cli. Returns structured violations with suggested fixes.
+    Requires set_project(sch_file=...) to have been called first.
     """
-    sheets_to_check = (
-        list(_project_state["sheets"].keys())
-        if scope == "all"
-        else ["current_sheet"]
+    sch = _sch_file()
+    if not sch:
+        return _stub_erc(scope)
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        out = f.name
+
+    rc, stdout, stderr = _run_cli(
+        "sch", "erc",
+        "--format", "json",
+        "--severity-all",
+        "--output", out,
+        sch,
     )
-    errors = []
-    warnings = []
 
-    for ref in _project_state["bom"]:
-        if ref not in _project_state["footprints"]:
-            warnings.append({
-                "type": "missing_footprint",
-                "severity": "warning",
-                "symbol_ref": ref,
-                "pin_name": None,
-                "position_x": None,
-                "position_y": None,
-                "suggested_fix": f"Call assign_footprint(reference='{ref}', footprint_path='...')",
-            })
+    try:
+        raw = json.loads(Path(out).read_text())
+    except Exception:
+        return _cli_error(stderr, rc)
+    finally:
+        Path(out).unlink(missing_ok=True)
 
-    # Check for labels that record a snap intent but weren't resolved (stub indicator)
-    for sheet_name, sheet_data in _project_state["sheets"].items():
-        for label in sheet_data.get("labels", []):
-            if "snap_to_ref" in label and "x" not in label:
-                errors.append({
-                    "type": "label_dangling",
-                    "severity": "error",
-                    "symbol_ref": label.get("snap_to_ref"),
-                    "pin_name": label.get("snap_to_pin"),
-                    "position_x": None,
-                    "position_y": None,
-                    "suggested_fix": (
-                        f"Resolve pin endpoint for {label['snap_to_ref']}:{label['snap_to_pin']} "
-                        f"and place label '{label['net_name']}' at that coordinate."
-                    ),
-                })
+    errors, warnings = [], []
+    for v in raw.get("violations", []):
+        sev = v.get("severity", "error").lower()
+        items = v.get("items", [])
+        ref = items[0].get("description", "") if items else ""
+        pos = items[0].get("pos", {}) if items else {}
+        entry = {
+            "type": v.get("type", "unknown"),
+            "severity": sev,
+            "symbol_ref": ref,
+            "pin_name": items[1].get("description", "") if len(items) > 1 else None,
+            "position_x": pos.get("x"),
+            "position_y": pos.get("y"),
+            "description": v.get("description", ""),
+            "suggested_fix": _erc_suggested_fix(v),
+        }
+        (errors if sev == "error" else warnings).append(entry)
 
     return {
         "status": "ok",
-        "scope": scope,
-        "sheets_checked": sheets_to_check,
+        "source": "kicad-cli",
+        "sch_file": sch,
         "error_count": len(errors),
         "warning_count": len(warnings),
         "errors": errors,
         "warnings": warnings,
-        "note": "STUB ERC — replace with real KiCad ERC engine",
+    }
+
+
+def _erc_suggested_fix(v: dict) -> str:
+    t = v.get("type", "")
+    desc = v.get("description", "")
+    if "dangling" in t or "dangling" in desc.lower():
+        return "Use snap_label_to_pin or move_label with snap_to_ref+snap_to_pin to connect the label to the nearest pin endpoint."
+    if "unconnected" in t:
+        return "Add a net label, wire, or no-connect marker to this pin."
+    if "power_flag" in t or "PWR_FLAG" in desc:
+        return "Add a PWR_FLAG symbol to this power net."
+    if "duplicate" in t:
+        return "Renumber the duplicate reference designator."
+    return desc
+
+
+def _stub_erc(scope: str) -> dict:
+    """In-memory stub ERC used when no sch_file is set."""
+    errors, warnings = [], []
+    for ref in _project_state["bom"]:
+        if ref not in _project_state["footprints"]:
+            warnings.append({
+                "type": "missing_footprint", "severity": "warning",
+                "symbol_ref": ref, "pin_name": None,
+                "position_x": None, "position_y": None,
+                "suggested_fix": f"Call assign_footprint(reference='{ref}', footprint_path='...')",
+            })
+    for sheet_data in _project_state["sheets"].values():
+        for label in sheet_data.get("labels", []):
+            if "snap_to_ref" in label and "x" not in label:
+                errors.append({
+                    "type": "label_dangling", "severity": "error",
+                    "symbol_ref": label.get("snap_to_ref"),
+                    "pin_name": label.get("snap_to_pin"),
+                    "position_x": None, "position_y": None,
+                    "suggested_fix": (
+                        f"Resolve pin endpoint for {label['snap_to_ref']}:{label['snap_to_pin']} "
+                        f"and snap label '{label['net_name']}' there."
+                    ),
+                })
+    return {
+        "status": "ok", "source": "stub",
+        "note": "Set sch_file via set_project() to run real ERC",
+        "error_count": len(errors), "warning_count": len(warnings),
+        "errors": errors, "warnings": warnings,
     }
 
 
@@ -729,26 +826,78 @@ def add_via(
 
 def run_drc(rules_preset: str = "default") -> dict:
     """
-    Stub DRC. Replace with KiCad IPC DRC API or pcbnew DRC runner.
+    Run DRC via kicad-cli. Returns structured violations.
+    Requires set_project(pcb_file=...) to have been called first.
     """
-    errors = []
-    outline = _project_state.get("board_outline")
-    if not outline:
-        errors.append({"type": "missing_outline", "message": "No board outline defined."})
+    pcb = _pcb_file()
+    if not pcb:
+        return _stub_drc()
 
-    unplaced = set(_project_state["bom"].keys()) - set(_project_state["placements"].keys())
-    for ref in unplaced:
-        errors.append({"type": "unplaced_component", "reference": ref,
-                       "message": f"{ref} has not been placed on the PCB."})
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        out = f.name
+
+    rc, stdout, stderr = _run_cli(
+        "pcb", "drc",
+        "--format", "json",
+        "--severity-all",
+        "--schematic-parity",
+        "--output", out,
+        pcb,
+    )
+
+    try:
+        raw = json.loads(Path(out).read_text())
+    except Exception:
+        return _cli_error(stderr, rc)
+    finally:
+        Path(out).unlink(missing_ok=True)
+
+    errors, warnings = [], []
+    for v in raw.get("violations", []):
+        sev = v.get("severity", "error").lower()
+        items = v.get("items", [])
+        pos = items[0].get("pos", {}) if items else {}
+        entry = {
+            "type": v.get("type", "unknown"),
+            "severity": sev,
+            "description": v.get("description", ""),
+            "position_x": pos.get("x"),
+            "position_y": pos.get("y"),
+            "items": [i.get("description", "") for i in items],
+        }
+        (errors if sev == "error" else warnings).append(entry)
+
+    unconnected = raw.get("unconnected_items", [])
 
     return {
         "status": "ok",
+        "source": "kicad-cli",
+        "pcb_file": pcb,
         "rules_preset": rules_preset,
         "error_count": len(errors),
-        "warning_count": 0,
+        "warning_count": len(warnings),
+        "unconnected_count": len(unconnected),
         "errors": errors,
-        "all_clear": len(errors) == 0,
-        "note": "STUB DRC — replace with real KiCad DRC engine",
+        "warnings": warnings,
+        "unconnected": unconnected,
+        "all_clear": len(errors) == 0 and len(unconnected) == 0,
+    }
+
+
+def _stub_drc() -> dict:
+    errors = []
+    if not _project_state.get("board_outline"):
+        errors.append({"type": "missing_outline", "severity": "error",
+                       "description": "No board outline defined."})
+    unplaced = set(_project_state["bom"].keys()) - set(_project_state["placements"].keys())
+    for ref in unplaced:
+        errors.append({"type": "unplaced_component", "severity": "error",
+                       "description": f"{ref} has not been placed on the PCB."})
+    return {
+        "status": "ok", "source": "stub",
+        "note": "Set pcb_file via set_project() to run real DRC",
+        "error_count": len(errors), "warning_count": 0,
+        "errors": errors, "all_clear": len(errors) == 0,
     }
 
 
@@ -785,17 +934,33 @@ def generate_gerbers(
     layer_count: int | None = None,
     format: str = "gerber_x2",
 ) -> dict:
-    layers = ["F.Cu", "B.Cu", "F.SilkS", "B.SilkS",
-              "F.Mask", "B.Mask", "F.Paste", "Edge.Cuts"]
+    """Generate Gerber files via kicad-cli. Requires set_project(pcb_file=...)."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "Call set_project(pcb_file=...) first."}
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    layers = "F.Cu,B.Cu,F.SilkS,B.SilkS,F.Mask,B.Mask,F.Paste,B.Paste,Edge.Cuts,F.Fab,B.Fab,F.Courtyard,B.Courtyard"
     if layer_count and layer_count >= 4:
-        layers = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"] + layers[2:]
+        layers = "F.Cu,In1.Cu,In2.Cu,B.Cu,F.SilkS,B.SilkS,F.Mask,B.Mask,F.Paste,B.Paste,Edge.Cuts,F.Fab,B.Fab"
+
+    args = ["pcb", "export", "gerbers", "--output", output_dir, "--layers", layers]
+    if format == "gerber_x1":
+        args.append("--no-x2")
+    args.append(pcb)
+
+    rc, stdout, stderr = _run_cli(*args)
+    if rc != 0:
+        return _cli_error(stderr, rc)
+
+    files = [f.name for f in Path(output_dir).iterdir() if f.suffix in (".gbr", ".gtl", ".gbl")]
     return {
         "status": "ok",
-        "note": "STUB — replace with pcbnew.PLOT_CONTROLLER or KiCad IPC export",
-        "output_dir": output_dir,
-        "format": format,
-        "layers_exported": layers,
-        "files_written": False,
+        "source": "kicad-cli",
+        "output_dir": str(Path(output_dir).resolve()),
+        "files_written": len(files),
+        "files": sorted(files),
     }
 
 
@@ -804,13 +969,29 @@ def generate_drill_files(
     format: str = "excellon",
     merge_pth_npth: bool = False,
 ) -> dict:
+    """Generate drill files via kicad-cli. Requires set_project(pcb_file=...)."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "Call set_project(pcb_file=...) first."}
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    args = ["pcb", "export", "drill", "--output", output_dir, "--format", format]
+    if not merge_pth_npth:
+        args.append("--excellon-separate-th")
+    args.append(pcb)
+
+    rc, stdout, stderr = _run_cli(*args)
+    if rc != 0:
+        return _cli_error(stderr, rc)
+
+    files = [f.name for f in Path(output_dir).iterdir() if f.suffix in (".drl", ".xln")]
     return {
         "status": "ok",
-        "note": "STUB — replace with pcbnew drill file export",
-        "output_dir": output_dir,
-        "format": format,
-        "files": ["pth.drl", "npth.drl"] if not merge_pth_npth else ["drill.drl"],
-        "files_written": False,
+        "source": "kicad-cli",
+        "output_dir": str(Path(output_dir).resolve()),
+        "files_written": len(files),
+        "files": sorted(files),
     }
 
 
@@ -820,24 +1001,31 @@ def generate_bom(
     quantity_for_price: int = 10,
     distributors: list[str] | None = None,
 ) -> dict:
-    rows = []
-    for ref, info in sorted(_project_state["bom"].items()):
-        rows.append({
-            "reference": ref,
-            "value": info.get("value", ""),
-            "footprint": info.get("footprint", "UNASSIGNED"),
-            "mpn": info.get("mpn", ""),
-            "mouser_pn": "",
-            "digikey_pn": "",
-            "unit_price_usd": "",
-        })
+    """Generate BOM via kicad-cli sch export bom. Requires set_project(sch_file=...)."""
+    sch = _sch_file()
+    if not sch:
+        return {"status": "error", "message": "Call set_project(sch_file=...) first."}
+
+    out = output_path or str(Path(sch).parent / "bom.csv")
+
+    rc, stdout, stderr = _run_cli(
+        "sch", "export", "bom",
+        "--output", out,
+        "--fields", "Reference,Value,Footprint,${QUANTITY},Manufacturer,MPN,${DNP}",
+        "--labels", "Refs,Value,Footprint,Qty,Manufacturer,MPN,DNP",
+        "--group-by", "Value,Footprint",
+        "--sort-field", "Reference",
+        "--exclude-dnp",
+        sch,
+    )
+    if rc != 0:
+        return _cli_error(stderr, rc)
+
     return {
         "status": "ok",
-        "note": "STUB — add real MPN / pricing lookup",
-        "output_path": output_path or "./bom.csv",
-        "row_count": len(rows),
-        "rows": rows,
-        "file_written": False,
+        "source": "kicad-cli",
+        "output_path": out,
+        "note": "Pricing/MPN data must be filled in the schematic fields or via a distributor API.",
     }
 
 
@@ -846,31 +1034,31 @@ def generate_position_file(
     units: str = "mm",
     side: str = "both",
 ) -> dict:
-    rows = []
-    for ref, placement in _project_state["placements"].items():
-        if placement.get("type") == "test_point":
-            continue
-        layer = placement.get("layer", "F.Cu")
-        if side == "top" and layer != "F.Cu":
-            continue
-        if side == "bottom" and layer != "B.Cu":
-            continue
-        rows.append({
-            "reference": ref,
-            "value": _project_state["bom"].get(ref, {}).get("value", ""),
-            "footprint": _project_state["footprints"].get(ref, ""),
-            "pos_x": placement["x"],
-            "pos_y": placement["y"],
-            "rotation": placement.get("rotation", 0),
-            "side": "top" if layer == "F.Cu" else "bottom",
-        })
+    """Generate pick-and-place position file via kicad-cli. Requires set_project(pcb_file=...)."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "Call set_project(pcb_file=...) first."}
+
+    out = output_path or str(Path(pcb).parent / "positions.csv")
+
+    rc, stdout, stderr = _run_cli(
+        "pcb", "export", "pos",
+        "--output", out,
+        "--format", "csv",
+        "--units", units,
+        "--side", side,
+        "--exclude-dnp",
+        pcb,
+    )
+    if rc != 0:
+        return _cli_error(stderr, rc)
+
     return {
         "status": "ok",
-        "output_path": output_path or "./positions.csv",
+        "source": "kicad-cli",
+        "output_path": out,
         "units": units,
-        "component_count": len(rows),
-        "rows": rows,
-        "file_written": False,
+        "side": side,
     }
 
 
@@ -878,12 +1066,28 @@ def generate_3d_model(
     output_path: str | None = None,
     format: str = "step",
 ) -> dict:
+    """Export 3D model via kicad-cli. Requires set_project(pcb_file=...)."""
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "Call set_project(pcb_file=...) first."}
+
+    out = output_path or str(Path(pcb).with_suffix(f".{format}"))
+
+    subcommand = "vrml" if format == "wrl" else "step"
+    rc, stdout, stderr = _run_cli(
+        "pcb", "export", subcommand,
+        "--output", out,
+        "--force",
+        pcb,
+    )
+    if rc != 0:
+        return _cli_error(stderr, rc)
+
     return {
         "status": "ok",
-        "note": "STUB — replace with pcbnew.BOARD.Export3DModel()",
-        "output_path": output_path or f"./board.{format}",
+        "source": "kicad-cli",
+        "output_path": out,
         "format": format,
-        "file_written": False,
     }
 
 
@@ -933,6 +1137,8 @@ def read_file(path: str, max_bytes: int = 65536) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DISPATCH_TABLE: dict[str, Any] = {
+    # Project setup
+    "set_project":             set_project,
     # Filesystem
     "list_directory":          list_directory,
     "read_file":               read_file,

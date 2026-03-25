@@ -8,6 +8,32 @@ Replace the stub dispatcher in dispatcher.py with your real KiCad IPC bridge.
 TOOLS = [
 
     # ═══════════════════════════════════════════════════════
+    # PROJECT — set active KiCad project files
+    # ═══════════════════════════════════════════════════════
+
+    {
+        "name": "set_project",
+        "description": (
+            "Set the active KiCad project files for this session. "
+            "Must be called before any tool that reads or writes a real KiCad file. "
+            "Accepts paths to the .kicad_pcb and/or .kicad_sch files."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pcb_file": {
+                    "type": "string",
+                    "description": "Absolute path to the .kicad_pcb file"
+                },
+                "sch_file": {
+                    "type": "string",
+                    "description": "Absolute path to the root .kicad_sch file"
+                }
+            }
+        }
+    },
+
+    # ═══════════════════════════════════════════════════════
     # FILESYSTEM — read local project files
     # ═══════════════════════════════════════════════════════
 
