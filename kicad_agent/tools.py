@@ -33,6 +33,64 @@ TOOLS = [
         }
     },
 
+    {
+        "name": "set_drc_severity",
+        "description": (
+            "Change the severity of a DRC rule type in the project's .kicad_pro file. "
+            "Use to suppress false positives from module footprints (e.g. castellated "
+            "ESP32 pads triggering solder_mask_bridge or drill_out_of_range). "
+            "Valid severities: error, warning, ignore. "
+            "Valid rule types match KiCad's rule_severities keys, e.g.: "
+            "solder_mask_bridge, clearance, drill_out_of_range, annular_width, "
+            "footprint_symbol_mismatch, missing_courtyard, silk_over_copper."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rule_type": {
+                    "type": "string",
+                    "description": "DRC rule name, e.g. 'solder_mask_bridge'"
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": ["error", "warning", "ignore"],
+                    "description": "New severity level"
+                }
+            },
+            "required": ["rule_type", "severity"]
+        }
+    },
+
+    {
+        "name": "add_drc_exclusion",
+        "description": (
+            "Add a custom design rule to the project's .kicad_dru file that exempts "
+            "a specific footprint reference from one or more DRC checks. "
+            "Use for known false positives scoped to a single component "
+            "(e.g. U1 ESP32 module internal geometry). "
+            "More precise than set_drc_severity since it applies only to the named reference."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reference": {
+                    "type": "string",
+                    "description": "Footprint reference to exclude, e.g. 'U1'"
+                },
+                "rule_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of DRC rule types to ignore for this reference, e.g. ['solder_mask_bridge', 'drill_out_of_range']"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Human-readable reason, written as a comment in the .kicad_dru file"
+                }
+            },
+            "required": ["reference", "rule_types"]
+        }
+    },
+
     # ═══════════════════════════════════════════════════════
     # FILESYSTEM — read local project files
     # ═══════════════════════════════════════════════════════

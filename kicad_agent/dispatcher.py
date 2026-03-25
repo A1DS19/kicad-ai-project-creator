@@ -45,6 +45,87 @@ _project_state: dict[str, Any] = {
 # Project setup
 # ─────────────────────────────────────────────────────────────────────────────
 
+def set_drc_severity(rule_type: str, severity: str) -> dict:
+    """
+    Change a rule_severities entry in the .kicad_pro file.
+    Edits the JSON in place — safe to call multiple times.
+    """
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "Call set_project(pcb_file=...) first."}
+
+    pro_file = Path(pcb).with_suffix(".kicad_pro")
+    if not pro_file.exists():
+        return {"status": "error", "message": f"Project file not found: {pro_file}"}
+
+    try:
+        data = json.loads(pro_file.read_text())
+        severities = data.setdefault("board", {}).setdefault(
+            "design_settings", {}
+        ).setdefault("rule_severities", {})
+
+        old = severities.get(rule_type, "not set")
+        severities[rule_type] = severity
+        pro_file.write_text(json.dumps(data, indent=2))
+
+        return {
+            "status": "ok",
+            "rule_type": rule_type,
+            "old_severity": old,
+            "new_severity": severity,
+            "file": str(pro_file),
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+def add_drc_exclusion(
+    reference: str,
+    rule_types: list[str],
+    reason: str = "",
+) -> dict:
+    """
+    Write a custom rule to the .kicad_dru file that ignores specific DRC
+    checks for a named footprint reference.
+
+    KiCad loads .kicad_dru automatically when it shares a name with the .kicad_pro.
+    Format: https://docs.kicad.org/en/design_rules/design_rules.html
+    """
+    pcb = _pcb_file()
+    if not pcb:
+        return {"status": "error", "message": "Call set_project(pcb_file=...) first."}
+
+    dru_file = Path(pcb).with_suffix(".kicad_dru")
+
+    # Build one rule block per rule_type for the given reference
+    lines = []
+    if reason:
+        lines.append(f"# {reason}")
+    for rule_type in rule_types:
+        rule_name = f"exclude_{rule_type}_{reference}".replace(" ", "_")
+        lines.append(f"(rule \"{rule_name}\"")
+        lines.append(f"  (severity ignore)")
+        lines.append(f"  (condition \"A.Reference == '{reference}' || B.Reference == '{reference}'\")")
+        lines.append(f"  (constraint {rule_type})")
+        lines.append(f")")
+        lines.append("")
+
+    block = "\n".join(lines)
+
+    try:
+        existing = dru_file.read_text() if dru_file.exists() else ""
+        dru_file.write_text(existing + ("\n" if existing and not existing.endswith("\n") else "") + block)
+        return {
+            "status": "ok",
+            "reference": reference,
+            "rule_types": rule_types,
+            "dru_file": str(dru_file),
+            "note": "Reload the PCB in KiCad (or run DRC again) to apply.",
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 def set_project(
     pcb_file: str | None = None,
     sch_file: str | None = None,
@@ -678,29 +759,136 @@ def place_footprint(
     rotation_deg: float = 0,
     layer: str = "F.Cu",
 ) -> dict:
-    if reference not in _project_state["footprints"] and reference not in _project_state["bom"]:
-        return {"status": "error", "message": f"Reference '{reference}' not in BOM."}
+    """
+    Move a footprint to the given position via kipy IPC.
+    KiCad must be running with the PCB open. Falls back to in-memory stub if not.
+    """
+    try:
+        from kipy.kicad import KiCad
+        from kipy.geometry import Vector2, Angle
+        from kipy.board_types import BoardLayer
+
+        kicad = KiCad()
+        board = kicad.get_board()
+
+        # Find footprint by reference designator
+        fps = board.get_footprints()
+        fp = next(
+            (f for f in fps if f.reference_field.text.value == reference),
+            None,
+        )
+        if fp is None:
+            return {"status": "error", "message": f"Footprint '{reference}' not found on board."}
+
+        old_pos = fp.position
+        fp.position = Vector2.from_xy_mm(x_mm, y_mm)
+        fp.orientation = Angle.from_degrees(rotation_deg)
+        fp.layer = BoardLayer.BL_B_Cu if layer == "B.Cu" else BoardLayer.BL_F_Cu
+
+        board.update_items(fp)
+        board.save()
+
+        return {
+            "status": "ok",
+            "source": "kipy",
+            "reference": reference,
+            "x_mm": x_mm,
+            "y_mm": y_mm,
+            "rotation_deg": rotation_deg,
+            "layer": layer,
+            "from": {
+                "x_mm": old_pos.x / 1_000_000,
+                "y_mm": old_pos.y / 1_000_000,
+            },
+        }
+
+    except ImportError:
+        pass
+    except Exception as e:
+        if "connect" in str(e).lower() or "socket" in str(e).lower():
+            return {
+                "status": "error",
+                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
+            }
+        return {"status": "error", "message": f"kipy error: {e}"}
+
+    # Stub fallback — no BOM validation, real PCB is the source of truth
     _project_state["placements"][reference] = {
-        "x": x_mm, "y": y_mm,
-        "rotation": rotation_deg, "layer": layer,
+        "x": x_mm, "y": y_mm, "rotation": rotation_deg, "layer": layer,
     }
-    return {"status": "ok", "reference": reference, "x": x_mm, "y": y_mm}
+    return {
+        "status": "ok",
+        "source": "stub",
+        "note": "KiCad not running — open PCB in KiCad for live placement",
+        "reference": reference,
+        "x_mm": x_mm,
+        "y_mm": y_mm,
+    }
 
 
 def get_ratsnest(net_filter: str | None = None) -> dict:
     """
-    Stub: Return unrouted connections.
-    Replace with pcbnew.BOARD.GetRatsnest() or similar IPC call.
+    Return nets and unconnected count via kipy IPC.
+    Falls back to stub if KiCad is not running.
     """
+    try:
+        from kipy.kicad import KiCad
+
+        kicad = KiCad()
+        board = kicad.get_board()
+        nets = board.get_nets()
+
+        net_list = [
+            {"name": n.name, "net_code": n.net_code}
+            for n in nets
+            if not net_filter or net_filter.lower() in n.name.lower()
+        ]
+
+        # Unconnected count comes from DRC — use kicad-cli if pcb_file is set
+        unconnected_count = None
+        pcb = _pcb_file()
+        if pcb:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+                out = f.name
+            rc, _, _ = _run_cli("pcb", "drc", "--format", "json",
+                                 "--severity-error", "--output", out, pcb)
+            try:
+                raw = json.loads(Path(out).read_text())
+                unconnected_count = len(raw.get("unconnected_items", []))
+            except Exception:
+                pass
+            finally:
+                Path(out).unlink(missing_ok=True)
+
+        return {
+            "status": "ok",
+            "source": "kipy",
+            "net_count": len(net_list),
+            "unconnected_count": unconnected_count,
+            "nets": net_list,
+        }
+
+    except ImportError:
+        pass
+    except Exception as e:
+        if "connect" in str(e).lower() or "socket" in str(e).lower():
+            return {
+                "status": "error",
+                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
+            }
+        return {"status": "error", "message": f"kipy error: {e}"}
+
+    # Stub fallback
     placed = set(_project_state["placements"].keys())
-    in_bom = set(_project_state["bom"].keys())
-    unplaced = in_bom - placed
+    unplaced = set(_project_state["bom"].keys()) - placed
     return {
         "status": "ok",
-        "unconnected_count": 0,
+        "source": "stub",
+        "note": "KiCad not running — open PCB in KiCad for live ratsnest",
+        "unconnected_count": None,
         "unplaced_components": list(unplaced),
         "nets": [],
-        "note": "STUB ratsnest — replace with real KiCad ratsnest query",
     }
 
 
@@ -750,12 +938,39 @@ def add_zone(
 
 
 def fill_zones() -> dict:
-    filled = 0
-    for zone in _project_state["zones"]:
-        if zone.get("type") == "copper":
-            zone["filled"] = True
-            filled += 1
-    return {"status": "ok", "zones_filled": filled}
+    """
+    Refill all copper zones via kipy IPC.
+    KiCad must be running with the PCB open. Falls back to stub if not.
+    """
+    try:
+        from kipy.kicad import KiCad
+
+        kicad = KiCad()
+        board = kicad.get_board()
+        board.refill_zones()
+        board.save()
+
+        zone_count = len(board.get_zones())
+        return {"status": "ok", "source": "kipy", "zones_filled": zone_count}
+
+    except ImportError:
+        pass
+    except Exception as e:
+        if "connect" in str(e).lower() or "socket" in str(e).lower():
+            return {
+                "status": "error",
+                "message": "KiCad is not running. Open the PCB in KiCad then retry.",
+            }
+        return {"status": "error", "message": f"kipy error: {e}"}
+
+    # Stub fallback
+    filled = sum(1 for z in _project_state["zones"] if z.get("type") == "copper")
+    for z in _project_state["zones"]:
+        if z.get("type") == "copper":
+            z["filled"] = True
+    return {"status": "ok", "source": "stub",
+            "note": "KiCad not running — zone fill recorded in memory only",
+            "zones_filled": filled}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1137,8 +1352,10 @@ def read_file(path: str, max_bytes: int = 65536) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DISPATCH_TABLE: dict[str, Any] = {
-    # Project setup
+    # Project setup & DRC rules
     "set_project":             set_project,
+    "set_drc_severity":        set_drc_severity,
+    "add_drc_exclusion":       add_drc_exclusion,
     # Filesystem
     "list_directory":          list_directory,
     "read_file":               read_file,
