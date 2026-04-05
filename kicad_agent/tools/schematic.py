@@ -18,6 +18,7 @@ from ..schematic_io import (
     _lib_sym_pins,
     _no_connect_sexp,
     _parse_sch_file,
+    _place_symbol,
     _resolve_pin_endpoint,
     _sch_lib_symbols,
     _sch_placed_symbols,
@@ -56,16 +57,30 @@ def add_symbol(
     rotation: float = 0,
     mirror_x: bool = False,
 ) -> dict:
+    sch = _sch_file()
+    if sch:
+        err = _place_symbol(sch, library, symbol, reference, value, x, y, rotation, mirror_x)
+        if err:
+            return {"status": "error", "message": err}
+        _project_state["bom"][reference] = {"value": value, "library": library, "symbol": symbol}
+        return {
+            "status": "ok",
+            "source": "kicad_sch",
+            "reference": reference,
+            "lib_id": f"{library}:{symbol}",
+            "sheet": sheet,
+        }
+
+    # In-memory fallback when no sch_file is set
     if sheet not in _project_state["sheets"]:
         return {"status": "error", "message": f"Sheet '{sheet}' not found. Create it first."}
-    entry = {
+    _project_state["sheets"][sheet]["symbols"].append({
         "library": library, "symbol": symbol,
         "reference": reference, "value": value,
         "x": x, "y": y, "rotation": rotation, "mirror_x": mirror_x,
-    }
-    _project_state["sheets"][sheet]["symbols"].append(entry)
+    })
     _project_state["bom"][reference] = {"value": value, "library": library, "symbol": symbol}
-    return {"status": "ok", "reference": reference, "sheet": sheet}
+    return {"status": "ok", "source": "stub", "reference": reference, "sheet": sheet}
 
 
 def add_power_symbol(net_name: str, x: float, y: float, sheet: str) -> dict:

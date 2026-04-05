@@ -91,6 +91,7 @@ def add_drc_exclusion(
 def set_project(
     pcb_file: str | None = None,
     sch_file: str | None = None,
+    create_sch_if_missing: bool = False,
 ) -> dict:
     """Store the active project file paths for this session."""
     if pcb_file:
@@ -101,7 +102,18 @@ def set_project(
     if sch_file:
         s = Path(sch_file).expanduser().resolve()
         if not s.exists():
-            return {"status": "error", "message": f"Schematic file not found: {s}"}
+            if create_sch_if_missing:
+                from ..schematic_io import _blank_sch_template
+                s.parent.mkdir(parents=True, exist_ok=True)
+                s.write_text(_blank_sch_template(), encoding="utf-8")
+            else:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"Schematic file not found: {s}. "
+                        "Pass create_sch_if_missing=true to create a blank schematic."
+                    ),
+                }
         _project_state["sch_file"] = str(s)
     return {
         "status": "ok",
@@ -179,6 +191,11 @@ TOOL_SCHEMAS = [
                 "sch_file": {
                     "type": "string",
                     "description": "Absolute path to the root .kicad_sch file"
+                },
+                "create_sch_if_missing": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "If true, create a blank .kicad_sch file when sch_file does not exist yet (use when starting a new design from scratch)"
                 }
             }
         }
