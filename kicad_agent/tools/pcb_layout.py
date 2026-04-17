@@ -6,7 +6,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from ..backends import _kicad, _run_cli
+from ..backends import _kicad, _run_cli, _try_kipy
 from ..state import _pcb_file, _project_state
 
 
@@ -164,13 +164,12 @@ def place_footprint(
     Move a footprint to the given position via kipy IPC.
     KiCad must be running with the PCB open. Falls back to in-memory stub if not.
     """
-    try:
+    def _kipy_place():
         kicad = _kicad()
         from kipy.geometry import Vector2, Angle
         from kipy.board_types import BoardLayer
 
         board = kicad.get_board()
-
         fps = board.get_footprints()
         fp = next(
             (f for f in fps if f.reference_field.text.value == reference),
@@ -186,7 +185,6 @@ def place_footprint(
 
         board.update_items(fp)
         board.save()
-
         return {
             "status": "ok",
             "source": "kipy",
@@ -201,30 +199,9 @@ def place_footprint(
             },
         }
 
-    except ImportError:
-        pass
-    except Exception:
-        # Fall through on any kipy error to the file-write fallback.
-        pass
-
-    # File-write fallback — pcbnew must be closed on this file.
-    pcb = _pcb_file()
-    if pcb:
-        from . import _pcb_writer as pw
-        hit = pw.move_footprint(pcb, reference, x_mm, y_mm, rotation_deg)
-        if not hit:
-            return {"status": "error",
-                    "message": f"Footprint '{reference}' not found in .kicad_pcb. Sync from schematic first (F8 in pcbnew)."}
-        _project_state["placements"][reference] = {
-            "x": x_mm, "y": y_mm, "rotation": rotation_deg, "layer": layer,
-        }
-        return {
-            "status": "ok", "source": "file",
-            "reference": reference,
-            "x_mm": x_mm, "y_mm": y_mm, "rotation_deg": rotation_deg,
-            "layer": layer,
-            "note": "Wrote placement directly to .kicad_pcb. Ensure pcbnew is closed on this file.",
-        }
+    result = _try_kipy(_kipy_place)
+    if result is not None:
+        return result
 
     _project_state["placements"][reference] = {
         "x": x_mm, "y": y_mm, "rotation": rotation_deg, "layer": layer,
@@ -238,7 +215,7 @@ def place_footprint(
 
 def get_ratsnest(net_filter: str | None = None) -> dict:
     """Return nets and unconnected count via kipy IPC."""
-    try:
+    def _kipy_ratsnest():
         kicad = _kicad()
         board = kicad.get_board()
         nets = board.get_nets()
@@ -259,7 +236,7 @@ def get_ratsnest(net_filter: str | None = None) -> dict:
             try:
                 raw = json.loads(Path(out).read_text())
                 unconnected_count = len(raw.get("unconnected_items", []))
-            except Exception:
+            except (json.JSONDecodeError, OSError):
                 pass
             finally:
                 Path(out).unlink(missing_ok=True)
@@ -272,15 +249,9 @@ def get_ratsnest(net_filter: str | None = None) -> dict:
             "nets": net_list,
         }
 
-    except ImportError:
-        pass
-    except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {
-                "status": "error",
-                "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it).",
-            }
-        return {"status": "error", "message": f"kipy error: {e}"}
+    result = _try_kipy(_kipy_ratsnest)
+    if result is not None:
+        return result
 
     # Stub fallback
     placed = set(_project_state["placements"].keys())
@@ -352,24 +323,17 @@ def add_zone(
 
 def fill_zones() -> dict:
     """Refill all copper zones via kipy IPC."""
-    try:
+    def _kipy_fill():
         kicad = _kicad()
         board = kicad.get_board()
         board.refill_zones()
         board.save()
-
         zone_count = len(board.get_zones())
         return {"status": "ok", "source": "kipy", "zones_filled": zone_count}
 
-    except ImportError:
-        pass
-    except Exception as e:
-        if "connect" in str(e).lower() or "socket" in str(e).lower():
-            return {
-                "status": "error",
-                "message": "KiCad IPC unavailable. Ensure: (1) KiCad main app is open, (2) the .kicad_pcb is open in the PCB Editor window, (3) Preferences → Plugins → 'Enable KiCad API' is checked (restart KiCad if you just enabled it).",
-            }
-        return {"status": "error", "message": f"kipy error: {e}"}
+    result = _try_kipy(_kipy_fill)
+    if result is not None:
+        return result
 
     # Stub fallback
     filled = sum(1 for z in _project_state["zones"] if z.get("type") == "copper")
